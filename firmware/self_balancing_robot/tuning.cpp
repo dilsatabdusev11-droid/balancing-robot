@@ -9,7 +9,7 @@ namespace {
 bool is(const Command& cmd, const char* name) { return strcmp(cmd.name, name) == 0; }
 
 void printParam(const Settings& settings, const ParamInfo& param, Print& out) {
-  out.printf("  %-9s (%s) = %8.3f   [%g .. %g] %s\n", param.name, param.alias,
+  out.printf("  %-9s %-3s = %8.3f   [%g .. %g] %s\n", param.name, param.alias,
              settings.*(param.field), param.minValue, param.maxValue, param.description);
 }
 
@@ -20,7 +20,7 @@ void printSettings(const Settings& settings, Print& out) {
   const ParamInfo* params = paramTable(count);
   out.println("Settings:");
   for (size_t i = 0; i < count; ++i) printParam(settings, params[i], out);
-  out.printf("  autotrim  (a) = %s\n", settings.autoTrim ? "on" : "off");
+  out.printf("  autotrim  a   = %s\n", settings.autoTrim ? "on" : "off");
 }
 
 void printHelp(Print& out) {
@@ -34,6 +34,7 @@ void printHelp(Print& out) {
   out.println("  zero             base = current angle (stop, hold at balance point first)");
   out.println("  calib            re-measure the gyro offset (stop first, keep still)");
   out.println("  motortest        spin left then right wheel forward (stop, wheels in air)");
+  out.println("  encoders         wheel encoder counts since the last call (direction check)");
   out.println("  help             this list");
 }
 

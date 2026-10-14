@@ -56,6 +56,37 @@ struct AutoTrim {
   void reset() { *this = AutoTrim(); }
 };
 
+// Forward speed of the robot from wheel encoder counts, smoothed.
+struct WheelSpeed {
+  float speed = 0.0f;  // m/s, positive = forward
+
+  float update(float leftCounts, float rightCounts, float dt, float metersPerCount,
+               float filterSeconds) {
+    const float raw = (leftCounts + rightCounts) * 0.5f * metersPerCount / dt;
+    speed += (raw - speed) * (dt / (filterSeconds + dt));
+    return speed;
+  }
+};
+
+// Outer loop for robots with wheel encoders: turns a speed error into a lean.
+// To speed up forward the robot has to lean forward (the balance loop then
+// rolls the wheels after it); to stop it has to lean back. The integral holds
+// the robot on one spot and replaces auto-trim.
+struct SpeedLoop {
+  float integral = 0.0f;
+
+  float update(float wantedSpeed, float measuredSpeed, float dt, float kp, float ki,
+               float limitDeg) {
+    const float error = wantedSpeed - measuredSpeed;
+    if (ki > 0.0f) {
+      integral = clampf(integral + error * dt, -limitDeg / ki, limitDeg / ki);
+    }
+    return clampf(kp * error + ki * integral, -limitDeg, limitDeg);
+  }
+
+  void reset() { integral = 0.0f; }
+};
+
 enum class RobotState { Calibrating, Waiting, Balancing, Fallen, Stopped, LowBattery, ImuFault };
 
 inline const char* stateName(RobotState state) {

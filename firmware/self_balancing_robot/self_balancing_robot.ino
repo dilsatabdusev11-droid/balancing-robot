@@ -25,6 +25,7 @@
 #include "config.h"
 #include "control.h"
 #include "drive_math.h"
+#include "encoders.h"
 #include "imu.h"
 #include "motors.h"
 #include "settings.h"
@@ -68,10 +69,18 @@ float pidOutput = 0.0f;
 
 constexpr ArmingConfig kArmingConfig = {ARM_ANGLE_DEG, ARM_HOLD_S, FALL_ANGLE_DEG};
 
+// --- Speed loop (only with wheel encoders) ------------------------------------
+constexpr float kMetersPerCount = 3.14159265f * WHEEL_DIAMETER_M / ENCODER_COUNTS_PER_WHEEL_REV;
+WheelSpeed wheelSpeed;
+SpeedLoop speedLoop;
+float wantedSpeed = 0.0f;  // m/s, ramped toward the phone command
+float speedLean = 0.0f;    // lean the speed loop asks for, deg
+
 // --- Bluetooth drive control ------------------------------------------------
 // Driving forward/backward gently LEANS the balance target angle; the balance
 // PID then rolls the wheels to chase that lean, which gives smooth
-// acceleration. Turning gives the two wheels small opposite offsets around the
+// acceleration. With encoders the phone sets a speed instead and the speed
+// loop picks the lean. Turning gives the two wheels small opposite offsets around the
 // shared PID output, which changes yaw only, so it never fights the balance.
 float moveTilt = 0.0f;  // current forward/backward lean added to baseAngle
 float turnBias = 0.0f;  // current left/right wheel speed difference
@@ -98,6 +107,7 @@ void setup() {
 
   motorsBegin();
   batteryBegin();
+  encodersBegin();
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, I2C_CLOCK_HZ);
   Wire.setTimeOut(I2C_TIMEOUT_MS);  // a broken wire must not stall the loop
@@ -163,7 +173,16 @@ void controlStep(float dt) {
 
   updateDriveRamps(dt);
   const float uprightAngle = settings.baseAngle + autoTrim.offset;
-  targetAngle = uprightAngle + moveTilt;
+  if (ENCODERS_ENABLED) {
+    int32_t leftCounts = 0, rightCounts = 0;
+    encodersTake(leftCounts, rightCounts);
+    wheelSpeed.update(leftCounts, rightCounts, dt, kMetersPerCount, SPEED_FILTER_S);
+    speedLean = speedLoop.update(wantedSpeed, wheelSpeed.speed, dt, settings.speedKp,
+                                 settings.speedKi, SPEED_TILT_LIMIT_DEG);
+    targetAngle = uprightAngle + speedLean;
+  } else {
+    targetAngle = uprightAngle + moveTilt;
+  }
 
   const RobotState previous = arming.state;
   const ArmingInputs inputs = {imuStatus == ImuRead::Ok, calibratingGyro,
@@ -194,13 +213,16 @@ void controlStep(float dt) {
   pidOutput = pid.update(currentAngle - targetAngle, pitchRate, dt, gains, PID_INTEGRAL_LIMIT,
                          kMaxCommand);
   motorsDrive(pidOutput - turnBias, pidOutput + turnBias, batteryCompensation());
-  autoTrim.update(pidOutput, dt, settings.autoTrim && btCommand == 'L', AUTOTRIM_RATE,
-                  AUTOTRIM_AVERAGE_S, AUTOTRIM_LIMIT_DEG);
+  // With encoders the speed loop's integral already finds the balance point.
+  autoTrim.update(pidOutput, dt, settings.autoTrim && !ENCODERS_ENABLED && btCommand == 'L',
+                  AUTOTRIM_RATE, AUTOTRIM_AVERAGE_S, AUTOTRIM_LIMIT_DEG);
 }
 
 void onStateChanged(RobotState state) {
   pid.reset();  // every (re)start of balancing begins from a clean controller
+  speedLoop.reset();
   pidOutput = 0.0f;
+  speedLean = 0.0f;
   Serial.printf("-> State: %s\n", stateName(state));
   if (state == RobotState::Waiting) {
     Serial.println("   Hold the robot upright: the motors start after half a second.");
@@ -256,8 +278,9 @@ void logStatus() {
   static uint32_t lastLogMs = 0;
   if (millis() - lastLogMs < 100) return;
   lastLogMs = millis();
-  Serial.printf("%s | Angle: %.2f | Target: %.2f | Trim: %.2f | PID: %.2f\n", stateName(arming.state),
-                currentAngle, targetAngle, autoTrim.offset, pidOutput);
+  Serial.printf("%s | Angle: %.2f | Target: %.2f | Trim: %.2f | PID: %.2f | Speed: %.2f\n",
+                stateName(arming.state), currentAngle, targetAngle, autoTrim.offset, pidOutput,
+                wheelSpeed.speed);
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +337,16 @@ bool handleActionCommand(const char* name) {
       settings.baseAngle = clampf(currentAngle, -45.0f, 45.0f);
       autoTrim.reset();
       Serial.printf("-> base = %.2f (current angle). Type 'save' to keep it.\n", settings.baseAngle);
+    }
+  } else if (strcmp(name, "encoders") == 0) {
+    if (!ENCODERS_ENABLED) {
+      Serial.println("! Encoders are off: set ENCODERS_ENABLED in config.h.");
+    } else {
+      int32_t left = 0, right = 0;
+      encodersReadTotals(left, right);
+      Serial.printf("-> Counts since last check: left %ld, right %ld (one wheel turn = %.0f).\n",
+                    static_cast<long>(left), static_cast<long>(right), ENCODER_COUNTS_PER_WHEEL_REV);
+      Serial.println("   Roll the robot FORWARD and check again: both must be positive.");
     }
   } else if (strcmp(name, "motortest") == 0) {
     if (balancing) {
@@ -374,6 +407,11 @@ void updateDriveRamps(float dt) {
   if (btCommand == 'W') tiltTarget = settings.moveTiltMax;
   else if (btCommand == 'S') tiltTarget = -settings.moveTiltMax;
   moveTilt = rampToward(moveTilt, tiltTarget, settings.moveTiltMax / settings.tiltRampTime * dt);
+
+  float speedTarget = 0.0f;
+  if (btCommand == 'W') speedTarget = settings.maxSpeed;
+  else if (btCommand == 'S') speedTarget = -settings.maxSpeed;
+  wantedSpeed = rampToward(wantedSpeed, speedTarget, settings.maxSpeed / settings.tiltRampTime * dt);
 
   float turnTarget = 0.0f;
   if (btCommand == 'D') turnTarget = settings.turnMax;

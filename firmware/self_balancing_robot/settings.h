@@ -9,7 +9,7 @@
 
 // Bump when the Settings layout changes: stored settings with another version
 // are ignored and the defaults are used instead.
-constexpr unsigned kSettingsVersion = 1;
+constexpr unsigned kSettingsVersion = 2;
 
 struct Settings {
   float kp = 15.0f;             // balance PID gains
@@ -22,11 +22,16 @@ struct Settings {
   float turnRampTime = 1.0f;    // seconds from 0 to full turn
   float remoteTimeoutMs = 600;  // stop driving if the phone goes quiet this long
   bool autoTrim = false;        // slowly correct baseAngle while standing
+  // Speed loop, used only with wheel encoders (ENCODERS_ENABLED in config.h):
+  // lean (deg) per m/s of speed error, its integral gain, and the top speed.
+  float speedKp = 3.0f;
+  float speedKi = 1.0f;
+  float maxSpeed = 0.3f;  // m/s
 };
 
 struct ParamInfo {
   const char* name;
-  const char* alias;  // one-letter command kept from the original sketch
+  const char* alias;  // one-letter command kept from the original sketch, or ""
   float Settings::*field;
   float minValue;
   float maxValue;
@@ -44,6 +49,9 @@ inline const ParamInfo* paramTable(size_t& count) {
       {"ramp", "r", &Settings::tiltRampTime, 0.05f, 10.0f, "drive ramp time, s"},
       {"turnramp", "u", &Settings::turnRampTime, 0.05f, 10.0f, "turn ramp time, s"},
       {"timeout", "x", &Settings::remoteTimeoutMs, 50.0f, 5000.0f, "remote timeout, ms"},
+      {"vkp", "", &Settings::speedKp, 0.0f, 50.0f, "speed loop P, deg per m/s"},
+      {"vki", "", &Settings::speedKi, 0.0f, 50.0f, "speed loop I, deg per m"},
+      {"vmax", "", &Settings::maxSpeed, 0.05f, 1.5f, "top speed with encoders, m/s"},
   };
   count = sizeof(kParams) / sizeof(kParams[0]);
   return kParams;

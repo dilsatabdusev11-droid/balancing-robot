@@ -85,6 +85,25 @@ inline float pitchRateFromGyro(float gx, float gy, float gz) {
 }
 
 // ---------------------------------------------------------------------------
+// Wheel encoders (optional): motors with Hall encoders on channels A and B
+// ---------------------------------------------------------------------------
+// Without encoders the robot only holds its angle: it slowly rolls away and
+// cannot stand on one spot. With them a speed loop picks the lean angle.
+constexpr bool ENCODERS_ENABLED = false;
+constexpr int PIN_ENC_LEFT_A = 18;
+constexpr int PIN_ENC_LEFT_B = 19;
+constexpr int PIN_ENC_RIGHT_A = 23;
+constexpr int PIN_ENC_RIGHT_B = 32;
+// Flip so that both counts grow when the robot rolls forward ("encoders").
+constexpr bool LEFT_ENCODER_REVERSED = false;
+constexpr bool RIGHT_ENCODER_REVERSED = false;
+// Rising edges on channel A per wheel turn: motor pulses x gear ratio.
+constexpr float ENCODER_COUNTS_PER_WHEEL_REV = 11.0f * 48.0f;
+constexpr float WHEEL_DIAMETER_M = 0.065f;
+constexpr float SPEED_FILTER_S = 0.05f;       // smoothing of the measured speed
+constexpr float SPEED_TILT_LIMIT_DEG = 6.0f;  // max lean the speed loop may ask for
+
+// ---------------------------------------------------------------------------
 // Control loop
 // ---------------------------------------------------------------------------
 constexpr uint32_t CONTROL_PERIOD_US = 5000;  // 200 Hz

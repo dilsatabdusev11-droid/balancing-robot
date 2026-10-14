@@ -128,3 +128,40 @@ TEST(motor_test_runs_left_then_right_then_stops) {
   CHECK(!test.step(1.0f, 35.0f, left, right));
   CHECK(!test.running());
 }
+
+TEST(wheel_speed_converts_counts_to_meters_per_second) {
+  WheelSpeed speed;
+  // 10 counts per wheel in 5 ms at 1 mm per count = 2 m/s (no smoothing).
+  CHECK_NEAR(speed.update(10.0f, 10.0f, kDt, 0.001f, 0.0f), 2.0, 1e-4);
+  // Wheels turning opposite ways (spinning on the spot) is no forward speed.
+  WheelSpeed spin;
+  CHECK_NEAR(spin.update(10.0f, -10.0f, kDt, 0.001f, 0.0f), 0.0, 1e-6);
+}
+
+TEST(speed_loop_leans_forward_to_speed_up_and_back_to_slow_down) {
+  SpeedLoop loop;
+  CHECK(loop.update(0.3f, 0.0f, kDt, 3.0f, 0.0f, 6.0f) > 0.0f);
+  loop.reset();
+  CHECK(loop.update(0.0f, 0.3f, kDt, 3.0f, 0.0f, 6.0f) < 0.0f);
+}
+
+TEST(speed_loop_lean_is_limited_and_integral_bounded) {
+  SpeedLoop loop;
+  for (int i = 0; i < 100000; ++i) loop.update(1.0f, 0.0f, kDt, 3.0f, 1.0f, 6.0f);
+  CHECK_NEAR(loop.update(1.0f, 0.0f, kDt, 3.0f, 1.0f, 6.0f), 6.0, 1e-5);
+  CHECK(loop.integral <= 6.0f + 1e-5f);
+}
+
+TEST(speed_loop_holds_the_robot_on_one_spot_despite_wrong_base_angle) {
+  // Toy model: leaning by phi from the true balance point accelerates the
+  // robot at g * tan(phi). The base angle is 1 deg off, which without the
+  // speed loop makes the robot roll away for ever.
+  const float baseError = -1.0f;
+  SpeedLoop loop;
+  float speed = 0.0f;
+  for (float t = 0.0f; t < 60.0f; t += kDt) {
+    const float lean = loop.update(0.0f, speed, kDt, 3.0f, 1.0f, 6.0f);
+    speed += 9.81f * tanf((lean + baseError) * 3.14159265f / 180.0f) * kDt;
+  }
+  CHECK_NEAR(speed, 0.0, 0.01);
+}
