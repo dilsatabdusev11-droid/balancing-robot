@@ -141,14 +141,12 @@ PID gains and control parameters can be tuned in real time over the USB Serial M
 
 1. Open `firmware/self_balancing_robot/self_balancing_robot.ino` in the Arduino IDE. Pins, motor directions and the IMU orientation are in `config.h` next to it.
 2. Install the ESP32 board package in Arduino IDE (**Boards Manager** → search `esp32` → install). Select **ESP32 Dev Module** as the target board.
-3. Install required libraries via the Arduino Library Manager:
-   - `Adafruit MPU6050`
-   - `Adafruit Unified Sensor`
-   - `BluetoothSerial` (bundled with ESP32 core)
+3. No extra libraries are needed: the MPU-6050 is read directly and `BluetoothSerial`, `Preferences` and `Wire` come with the ESP32 core.
 4. Wire the hardware according to the pinout table above.
 5. Flash the firmware and open the Serial Monitor at **115200 baud**.
-6. Pair your phone's Bluetooth with the device named **`DengeRobot`** and connect using a pad-style BT controller app.
-7. Stand the robot upright, then tune $K_p$, $K_i$, $K_d$, and the base target angle live over Serial.
+6. Keep the robot still for the first second after power-on while the gyro offset is measured.
+7. Pair your phone's Bluetooth with the device named **`DengeRobot`** and connect using a pad-style BT controller app.
+8. Stand the robot upright, then tune $K_p$, $K_i$, $K_d$, and the base target angle live over Serial.
 
 ---
 

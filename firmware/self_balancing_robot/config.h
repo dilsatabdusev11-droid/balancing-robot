@@ -54,6 +54,21 @@ constexpr float BATTERY_RESUME_VOLTS = 6.8f;   // run again after charging
 constexpr int PIN_I2C_SDA = 21;
 constexpr int PIN_I2C_SCL = 22;
 constexpr uint8_t IMU_I2C_ADDRESS = 0x68;  // 0x69 if AD0 is tied to 3.3 V
+constexpr uint32_t I2C_CLOCK_HZ = 400000;   // fast mode: one IMU read takes ~0.5 ms
+constexpr uint16_t I2C_TIMEOUT_MS = 10;
+
+// MPU-6050 built-in low-pass filter (DLPF_CFG): 4 = ~21 Hz like the original
+// build; 3 = ~43 Hz reacts faster but is noisier.
+constexpr uint8_t IMU_LOW_PASS_CONFIG = 4;
+// How long (s) the gyro is trusted before the accelerometer pulls the angle
+// back. Longer = less disturbed by the robot's own acceleration.
+constexpr float IMU_FILTER_TIME_CONSTANT_S = 0.5f;
+constexpr int IMU_MAX_READ_ERRORS = 3;  // consecutive failed reads before motors stop
+constexpr uint32_t IMU_RETRY_MS = 500;
+
+// Gyro offset calibration at boot and with the "calib" command.
+constexpr int GYRO_CALIBRATION_SAMPLES = 200;  // 1 s at 200 Hz
+constexpr float GYRO_STILL_SPREAD_DPS = 2.0f;  // more spread = robot moved, retry
 
 // Pitch angle (degrees) from the accelerometer and pitch rate (deg/s) from the
 // gyro. These match an MPU-6050 mounted upside down on the lid. If your board
@@ -68,3 +83,9 @@ inline float pitchRateFromGyro(float gx, float gy, float gz) {
   (void)gz;
   return gy;
 }
+
+// ---------------------------------------------------------------------------
+// Control loop
+// ---------------------------------------------------------------------------
+constexpr uint32_t CONTROL_PERIOD_US = 5000;  // 200 Hz
+constexpr float FALL_ANGLE_DEG = 30.0f;       // beyond this the robot has fallen

@@ -15,19 +15,19 @@
 
 #include <Wire.h>
 
+#include "BluetoothSerial.h"
 #include "battery.h"
-#include "config.h"
 #include "command.h"
+#include "config.h"
+#include "control.h"
+#include "imu.h"
 #include "motors.h"
 #include "settings.h"
 #include "settings_store.h"
 #include "tuning.h"
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
-#include "BluetoothSerial.h"
 
-Adafruit_MPU6050 mpu;
 BluetoothSerial SerialBT;
+Mpu6050 imu;
 
 // Live-tunable values (gains, base angle, drive limits). See settings.h for
 // defaults and ranges; change them over Serial, keep them with "save".
@@ -39,53 +39,51 @@ BluetoothSerial SerialBT;
 Settings settings;
 LineReader serialLine;
 
-double targetAngle = 0.0;            // actual angle the PID is chasing right now
-double currentAngle = 0.0;            // filtered current tilt angle (complementary filter)
-double error = 0.0, prevError = 0.0;
-double integral = 0.0, derivative = 0.0;
-double pidOutput = 0.0;
+// --- Angle estimation -------------------------------------------------------
+enum class ImuRead { Ok, Skip, Fault };
+ComplementaryFilter tiltFilter;
+GyroCalibrator gyroCalibrator;
+bool calibratingGyro = true;  // the first second after boot: keep the robot still
+float gyroBias = 0.0f;        // deg/s read by the gyro at rest
+int imuReadErrors = 0;
+bool imuFault = false;
+uint32_t lastImuRetryMs = 0;
 
-// ---------------------------------------------------------------------------
-// AUTO-TRIM (drift correction)
-// ---------------------------------------------------------------------------
-// If the robot consistently drifts/leans one way even while "balanced",
-// it usually means settings.baseAngle isn't perfectly matched to the real
-// mechanical balance point. Auto-trim watches the long-term average PID
-// output and, if enabled, very slowly nudges settings.baseAngle toward the
-// value that would make that average zero.
-double trimRate = 0.0005;  // how fast auto-trim corrects. Keep VERY small.
-                            // If it makes drift WORSE, flip the sign in the
-                            // "if (settings.autoTrim)" block below.
-double outputAvg = 0.0;    // slow (long-term) rolling average of pidOutput
+float currentAngle = 0.0f;  // filtered tilt angle, deg
+float pitchRate = 0.0f;     // bias-corrected tilt rate, deg/s
+float targetAngle = 0.0f;   // angle the PID is chasing right now
 
-unsigned long lastTime = 0;
-double dt = 0.01; // loop time delta in seconds, recalculated every loop
+// --- Balance PID ------------------------------------------------------------
+float error = 0.0f, prevError = 0.0f;
+float integral = 0.0f;
+float pidOutput = 0.0f;
 
-// =============================================================================
-// BLUETOOTH DRIVE CONTROL
-// =============================================================================
-// Design idea: instead of feeding raw speed to the motors (which would
-// fight the balance PID and make the robot fall), driving forward/backward
-// is done by very gently LEANING the balance target angle in that
-// direction. The balance PID then naturally drives the wheels to "chase"
-// that lean, producing smooth acceleration. Left/right turning is done by
-// giving the two wheels a small opposite speed offset (turnBias) around
-// their shared PID output -- this only affects yaw (spin), not pitch
-// (front/back balance), so it doesn't fight the balance loop at all.
+// --- Auto-trim (drift correction) -------------------------------------------
+// If the robot consistently drifts one way while "balanced", baseAngle is not
+// quite the real balance point. Auto-trim watches the long-term average PID
+// output and, if enabled, slowly nudges baseAngle to make it zero.
+const float trimRate = 0.0005f;  // per control step. Keep VERY small.
+float outputAvg = 0.0f;          // slow rolling average of pidOutput
 
-double moveTilt = 0.0;   // current forward/backward lean added to settings.baseAngle
-double turnBias = 0.0;   // current left/right wheel speed difference
+// --- Bluetooth drive control ------------------------------------------------
+// Driving forward/backward gently LEANS the balance target angle; the balance
+// PID then rolls the wheels to chase that lean, which gives smooth
+// acceleration. Turning gives the two wheels small opposite offsets around the
+// shared PID output, which changes yaw only, so it never fights the balance.
+float moveTilt = 0.0f;  // current forward/backward lean added to baseAngle
+float turnBias = 0.0f;  // current left/right wheel speed difference
 
 char btCommand = 'L';
-unsigned long lastBtCommandTime = 0;
-// Failsafe: if no valid BT command arrives for settings.remoteTimeoutMs,
-// assume the connection dropped or the button was released, and stop.
-// ===========================================================================
+uint32_t lastBtCommandMs = 0;
 
-void readSerialCommands();
-void readBluetoothCommands();
+// --- Fixed-rate control loop ------------------------------------------------
+uint32_t lastControlUs = 0;
+uint32_t nextControlUs = 0;
 
 void setup() {
+  // A bigger TX buffer lets status prints return at once instead of waiting
+  // for the UART, which used to stretch some control loop iterations.
+  Serial.setTxBufferSize(1024);
   Serial.begin(115200);
   delay(500);
 
@@ -98,101 +96,154 @@ void setup() {
   motorsBegin();
   batteryBegin();
 
-  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-  if (!mpu.begin(IMU_I2C_ADDRESS, &Wire)) {
-    Serial.println("ERROR: MPU6050 not found!");
-    while (1) delay(10);
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, I2C_CLOCK_HZ);
+  Wire.setTimeOut(I2C_TIMEOUT_MS);  // a broken wire must not stall the loop
+  if (imu.begin(Wire, IMU_I2C_ADDRESS, IMU_LOW_PASS_CONFIG)) {
+    Serial.printf("IMU found (WHO_AM_I = 0x%02X).\n", imu.whoAmI());
+  } else {
+    imuFault = true;  // keep retrying in the loop; motors stay off meanwhile
+    Serial.println("! IMU (MPU6050) not found. Check SDA/SCL/VCC/GND; retrying...");
   }
+  startGyroCalibration();
 
-  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-
-  SerialBT.begin("DengeRobot"); // Bluetooth device name — pair your phone to this
+  SerialBT.begin("DengeRobot");  // Bluetooth device name - pair your phone to this
   Serial.println("Bluetooth is active. Pair your phone with 'DengeRobot'.");
 
-  lastTime = micros();
   Serial.println("\n=== Self-Balancing Robot Started ===");
   printHelp(Serial);
   Serial.println("Bluetooth commands: W forward, S backward, A left, D right, L stop");
+
+  lastControlUs = micros();
+  nextControlUs = lastControlUs + CONTROL_PERIOD_US;
 }
 
 void loop() {
-  // --- Compute the loop time delta FIRST, so both the Bluetooth ramp logic
-  //     and the PID controller use a fresh, consistent dt this iteration. ---
-  unsigned long now = micros();
-  dt = (now - lastTime) / 1000000.0;
-  if (dt <= 0.0) dt = 0.005;
-  lastTime = now;
-
+  // Everything here returns immediately; only the control step is timed.
   readSerialCommands();
+  readBluetoothCommands();
   batteryPoll();
-  readBluetoothCommands(); // uses dt above to ramp moveTilt/turnBias smoothly
 
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
+  const uint32_t now = micros();
+  if (static_cast<int32_t>(now - nextControlUs) >= 0) {
+    // Real elapsed time, limited so one slow iteration cannot kick the
+    // integrators (the old loop could see dt = 1 s after a blocking read).
+    const float dt = clampf((now - lastControlUs) * 1e-6f, 0.001f, 0.02f);
+    lastControlUs = now;
+    nextControlUs += CONTROL_PERIOD_US;
+    if (static_cast<int32_t>(now - nextControlUs) >= 0) nextControlUs = now + CONTROL_PERIOD_US;
+    controlStep(dt);
+  }
 
-  // Complementary filter: mostly trust the gyro (smooth, drifts slowly),
-  // and slowly correct with the accelerometer (noisy, but doesn't drift).
-  // 0.96/0.04 is a common starting split; raise the gyro weight (e.g. 0.98)
-  // for a smoother but slower-to-correct angle estimate.
-  double accAngle = pitchFromAccel(a.acceleration.x, a.acceleration.y, a.acceleration.z);
-  double gyroRate = pitchRateFromGyro(g.gyro.x * RAD_TO_DEG, g.gyro.y * RAD_TO_DEG, g.gyro.z * RAD_TO_DEG);
-  currentAngle = 0.96 * (currentAngle + gyroRate * dt) + 0.04 * accAngle;
+  logStatus();
+}
 
-  // Safety cutoff: if the robot has tipped over too far to recover
-  // (e.g. picked up, or already fallen), stop the motors instead of
-  // fighting the ground, and reset the integral/derivative state so it
-  // doesn't lurch when picked back up.
-  if (abs(currentAngle - targetAngle) > 30.0 || batteryLow()) {
+// ---------------------------------------------------------------------------
+// One 200 Hz control step: read the IMU, estimate the angle, run the PID.
+// ---------------------------------------------------------------------------
+void controlStep(float dt) {
+  ImuSample sample;
+  switch (readImu(sample)) {
+    case ImuRead::Ok: break;
+    case ImuRead::Skip: return;  // one glitch: keep the last motor command
+    case ImuRead::Fault:
+      motorsStop();
+      resetBalance();
+      return;
+  }
+
+  const float rawRate = pitchRateFromGyro(sample.gx, sample.gy, sample.gz);
+  if (calibratingGyro) {
     motorsStop();
-    integral = 0;
-    prevError = 0;
-  } else {
-    // Positive error = leaning forward past the target, and a positive output
-    // drives forward: the wheels roll under the falling body.
-    error = currentAngle - targetAngle;
-
-    integral += error * dt;
-    integral = constrain(integral, -60.0, 60.0); // anti-windup clamp
-
-    derivative = (error - prevError) / dt;
-    prevError = error;
-
-    pidOutput = (settings.kp * error) + (settings.ki * integral) + (settings.kd * derivative);
-    // Turning adds opposite offsets to the two wheels around the shared
-    // balance output, so it changes yaw only, never pitch.
-    motorsDrive(pidOutput - turnBias, pidOutput + turnBias, batteryCompensation());
-
-    // --- AUTO-TRIM ---
-    // Track a very slow rolling average of pidOutput. If the robot is
-    // balanced but the average output is consistently non-zero, that
-    // means settings.baseAngle is slightly off from the true mechanical
-    // balance point. When enabled, slowly nudge settings.baseAngle to
-    // cancel that average out.
-    outputAvg = outputAvg * 0.999 + pidOutput * 0.001;
-
-    if (settings.autoTrim) {
-      settings.baseAngle += outputAvg * trimRate;
-      // NOTE: if this makes drift WORSE instead of better, your motor/
-      // mounting orientation needs the opposite sign — change the line
-      // above to "+=".
-    }
+    runGyroCalibration(rawRate);
+    return;
   }
 
-  static unsigned long lastLog = 0;
-  if (millis() - lastLog > 100) {
-    lastLog = millis();
-    Serial.print("Angle: ");   Serial.print(currentAngle);
-    Serial.print(" | Target: "); Serial.print(targetAngle);
-    Serial.print(" | OutAvg: "); Serial.print(outputAvg);
-    Serial.print(" | Kp: ");   Serial.print(settings.kp);
-    Serial.print(" | Ki: ");   Serial.print(settings.ki);
-    Serial.print(" | Kd: ");   Serial.print(settings.kd);
-    Serial.print(" | PID: "); Serial.println(pidOutput);
+  pitchRate = rawRate - gyroBias;
+  currentAngle = tiltFilter.update(pitchFromAccel(sample.ax, sample.ay, sample.az), pitchRate,
+                                   dt, IMU_FILTER_TIME_CONSTANT_S);
+  updateDriveRamps(dt);
+  targetAngle = settings.baseAngle + moveTilt;
+
+  // Safety cutoff: tipped over too far to recover (picked up or already
+  // fallen) or the battery is empty: stop instead of fighting the ground.
+  if (fabsf(currentAngle - targetAngle) > FALL_ANGLE_DEG || batteryLow()) {
+    motorsStop();
+    resetBalance();
+    return;
   }
 
-  delay(4);
+  // Positive error = leaning forward past the target, and a positive output
+  // drives forward: the wheels roll under the falling body.
+  error = currentAngle - targetAngle;
+  integral = clampf(integral + error * dt, -60.0f, 60.0f);  // anti-windup clamp
+  const float derivative = (error - prevError) / dt;
+  prevError = error;
+  pidOutput = settings.kp * error + settings.ki * integral + settings.kd * derivative;
+  motorsDrive(pidOutput - turnBias, pidOutput + turnBias, batteryCompensation());
+
+  outputAvg = outputAvg * 0.999f + pidOutput * 0.001f;
+  if (settings.autoTrim) {
+    settings.baseAngle += outputAvg * trimRate;
+  }
+}
+
+void resetBalance() {
+  integral = 0.0f;
+  prevError = 0.0f;
+  pidOutput = 0.0f;
+}
+
+// ---------------------------------------------------------------------------
+// IMU reading with error handling: a single failed read keeps the previous
+// motor command; several in a row stop the motors until the sensor answers.
+// ---------------------------------------------------------------------------
+ImuRead readImu(ImuSample& sample) {
+  if (imuFault) {
+    if (millis() - lastImuRetryMs < IMU_RETRY_MS) return ImuRead::Fault;
+    lastImuRetryMs = millis();
+    if (!imu.begin(Wire, IMU_I2C_ADDRESS, IMU_LOW_PASS_CONFIG)) return ImuRead::Fault;
+    Serial.println("-> IMU answers again.");
+    imuFault = false;
+    imuReadErrors = 0;
+    tiltFilter.reset();
+  }
+  if (imu.read(sample)) {
+    imuReadErrors = 0;
+    return ImuRead::Ok;
+  }
+  if (++imuReadErrors < IMU_MAX_READ_ERRORS) return ImuRead::Skip;
+  imuFault = true;
+  lastImuRetryMs = millis();
+  Serial.println("! IMU stopped answering: motors off. Check the SDA/SCL wires.");
+  return ImuRead::Fault;
+}
+
+void startGyroCalibration() {
+  gyroCalibrator.reset();
+  calibratingGyro = true;
+  Serial.println("Calibrating gyro: keep the robot still for a second...");
+}
+
+void runGyroCalibration(float rawRate) {
+  gyroCalibrator.add(rawRate);
+  if (gyroCalibrator.samples < GYRO_CALIBRATION_SAMPLES) return;
+  if (!gyroCalibrator.stillEnough(GYRO_STILL_SPREAD_DPS)) {
+    Serial.println("! The robot moved during gyro calibration. Keep it still; retrying...");
+    gyroCalibrator.reset();
+    return;
+  }
+  gyroBias = gyroCalibrator.bias();
+  calibratingGyro = false;
+  tiltFilter.reset();
+  Serial.printf("-> Gyro calibrated: offset %.2f deg/s.\n", gyroBias);
+}
+
+void logStatus() {
+  static uint32_t lastLogMs = 0;
+  if (millis() - lastLogMs < 100) return;
+  lastLogMs = millis();
+  Serial.printf("Angle: %.2f | Target: %.2f | OutAvg: %.2f | Kp: %.2f | Ki: %.2f | Kd: %.2f | PID: %.2f\n",
+                currentAngle, targetAngle, outputAvg, settings.kp, settings.ki, settings.kd, pidOutput);
 }
 
 // ---------------------------------------------------------------------------
@@ -211,14 +262,19 @@ void handleCommandLine(const char* line) {
     case ParseStatus::Ok: break;
   }
 
+  if (strcmp(cmd.name, "calib") == 0) {
+    startGyroCalibration();
+    return;
+  }
+
   const float oldKi = settings.ki;
   const bool oldAutoTrim = settings.autoTrim;
   if (!handleSettingsCommand(cmd, settings, Serial)) {
     Serial.printf("! Unknown command '%s'. Type 'help'.\n", cmd.name);
     return;
   }
-  if (settings.ki != oldKi) integral = 0;  // a big Ki change must not cause a kick
-  if (settings.autoTrim != oldAutoTrim) outputAvg = 0;
+  if (settings.ki != oldKi) integral = 0.0f;  // a big Ki change must not cause a kick
+  if (settings.autoTrim != oldAutoTrim) outputAvg = 0.0f;
 }
 
 void readSerialCommands() {
@@ -232,53 +288,33 @@ void readSerialCommands() {
 }
 
 // ---------------------------------------------------------------------------
-// Reads the latest Bluetooth drive command and smoothly ramps the
-// forward/backward lean (moveTilt) and turn offset (turnBias) toward it
-// over time, instead of jumping instantly — this is what keeps driving
-// from fighting/destabilizing the balance PID.
-//
-// A phone Bluetooth-control app (e.g. "Arduino Bluetooth Controller" in
-// pad mode) typically re-sends the held key's character repeatedly while
-// pressed, and sends a different character (here treated as anything
-// other than W/S/A/D, commonly mapped to 'L') when released. This
-// function keeps the last recognized command and, if nothing valid is
-// heard for `settings.remoteTimeoutMs` ms, treats that as "released" and stops as a
-// safety failsafe.
+// Bluetooth drive commands. A pad-style phone app re-sends the held key while
+// it is pressed and sends 'L' on release. The last recognised command is kept;
+// if nothing valid arrives for remoteTimeoutMs, it counts as released.
 // ---------------------------------------------------------------------------
 void readBluetoothCommands() {
-  if (SerialBT.available()) {
-    char c = toupper(SerialBT.read());
+  while (SerialBT.available() > 0) {
+    const char c = static_cast<char>(toupper(SerialBT.read()));
     if (c == 'W' || c == 'S' || c == 'A' || c == 'D' || c == 'L') {
       btCommand = c;
-      lastBtCommandTime = millis();
+      lastBtCommandMs = millis();
     }
   }
-
-  // Safety failsafe: if the connection drops or the command stream stops
-  // arriving, automatically stop driving.
-  if (millis() - lastBtCommandTime > settings.remoteTimeoutMs) {
-    btCommand = 'L';
+  if (millis() - lastBtCommandMs > settings.remoteTimeoutMs) {
+    btCommand = 'L';  // connection dropped or button released: stop driving
   }
+}
 
-  // --- FORWARD / BACKWARD: ramp moveTilt toward its target over time ---
-  double tiltTarget = 0.0;
+// Ramps the drive lean and the turn offset toward the current command at a
+// constant rate per second, so the balance loop is never jolted.
+void updateDriveRamps(float dt) {
+  float tiltTarget = 0.0f;
   if (btCommand == 'W') tiltTarget = settings.moveTiltMax;
   else if (btCommand == 'S') tiltTarget = -settings.moveTiltMax;
+  moveTilt = rampToward(moveTilt, tiltTarget, settings.moveTiltMax / settings.tiltRampTime * dt);
 
-  // Time-based ramp: moves at a constant deg/second rate regardless of
-  // how fast/slow the loop happens to be running this cycle.
-  double tiltStep = (settings.moveTiltMax / settings.tiltRampTime) * dt;
-  if (moveTilt < tiltTarget)      moveTilt = min(moveTilt + tiltStep, tiltTarget);
-  else if (moveTilt > tiltTarget) moveTilt = max(moveTilt - tiltStep, tiltTarget);
-
-  targetAngle = settings.baseAngle + moveTilt;
-
-  // --- LEFT / RIGHT: ramp turnBias toward its target over time ---
-  double turnTarget = 0.0;
+  float turnTarget = 0.0f;
   if (btCommand == 'D') turnTarget = settings.turnMax;
   else if (btCommand == 'A') turnTarget = -settings.turnMax;
-
-  double turnStep = (settings.turnMax / settings.turnRampTime) * dt;
-  if (turnBias < turnTarget)      turnBias = min(turnBias + turnStep, turnTarget);
-  else if (turnBias > turnTarget) turnBias = max(turnBias - turnStep, turnTarget);
+  turnBias = rampToward(turnBias, turnTarget, settings.turnMax / settings.turnRampTime * dt);
 }

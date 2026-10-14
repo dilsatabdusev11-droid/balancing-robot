@@ -30,6 +30,7 @@ void printHelp(Print& out) {
   out.println("  show  (or ?)     list all parameters and their ranges");
   out.println("  save             keep the current values after a reboot");
   out.println("  defaults         back to factory values (also forgets saved ones)");
+  out.println("  calib            re-measure the gyro offset (keep the robot still)");
   out.println("  help             this list");
 }
 
