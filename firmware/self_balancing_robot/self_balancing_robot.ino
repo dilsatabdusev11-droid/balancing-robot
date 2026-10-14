@@ -159,6 +159,14 @@ void loop() {
 // the motors may run, run the PID.
 // ---------------------------------------------------------------------------
 void controlStep(float dt) {
+  // Encoder counts are taken every step, even when the IMU read is skipped,
+  // so the speed is always counts over the same dt.
+  if (ENCODERS_ENABLED) {
+    int32_t leftCounts = 0, rightCounts = 0;
+    encodersTake(leftCounts, rightCounts);
+    wheelSpeed.update(leftCounts, rightCounts, dt, kMetersPerCount, SPEED_FILTER_S);
+  }
+
   ImuSample sample;
   const ImuRead imuStatus = readImu(sample);
   if (imuStatus == ImuRead::Skip) return;  // one glitch: keep the last motor command
@@ -177,9 +185,6 @@ void controlStep(float dt) {
   updateDriveRamps(dt);
   const float uprightAngle = settings.baseAngle + autoTrim.offset;
   if (ENCODERS_ENABLED) {
-    int32_t leftCounts = 0, rightCounts = 0;
-    encodersTake(leftCounts, rightCounts);
-    wheelSpeed.update(leftCounts, rightCounts, dt, kMetersPerCount, SPEED_FILTER_S);
     speedLean = speedLoop.update(wantedSpeed, wheelSpeed.speed, dt, settings.speedKp,
                                  settings.speedKi, SPEED_TILT_LIMIT_DEG);
     targetAngle = uprightAngle + speedLean;
