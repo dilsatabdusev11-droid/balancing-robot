@@ -1,88 +1,29 @@
 /* =============================================================================
-   SELF-BALANCING ROBOT — MPU6050 + L298N + PID + Bluetooth (ESP32)
+   SELF-BALANCING ROBOT - MPU6050 + L298N + PID + Bluetooth (ESP32)
    =============================================================================
-   This sketch balances a two-wheeled robot using a PID controller fed by an
-   MPU6050 IMU, and lets you drive it (forward/back/turn) over classic
-   Bluetooth Serial from a phone app such as "Arduino Bluetooth Controller"
-   in "pad" mode.
+   Balances a two-wheeled robot with a PID controller fed by an MPU6050 IMU and
+   lets you drive it from a phone over classic Bluetooth Serial (for example the
+   "Arduino Bluetooth Controller" app in pad mode).
 
-   -----------------------------------------------------------------------
-   QUICK TUNING CHEAT-SHEET (type these into the Serial Monitor, 115200 baud)
-   -----------------------------------------------------------------------
-     p<value>   Set Kp                  e.g. p15.0
-     i<value>   Set Ki (resets integral) e.g. i0.7
-     d<value>   Set Kd                  e.g. d0.44
-     t<value>   Set target balance angle (baseTargetAngle) e.g. t3.0
-     a1 / a0    Turn auto-trim ON / OFF
-     m<value>   Set max forward/backward lean angle (deg)   e.g. m0.6
-     n<value>   Set max turn strength                       e.g. n10
-     r<value>   Set forward/backward ramp time (seconds)    e.g. r0.8
-     u<value>   Set turn ramp time (seconds)                e.g. u1.2
-     x<value>   Set Bluetooth failsafe timeout (ms)         e.g. x600
+   Robot-specific settings (pins, motor directions, IMU orientation) live in
+   config.h. Serial tuning commands (115200 baud):
+     p<value> Kp   i<value> Ki   d<value> Kd   t<value> base target angle
+     a1 / a0  auto-trim on/off   m<value> max lean (deg)   n<value> max turn
+     r<value> drive ramp (s)     u<value> turn ramp (s)    x<value> BT timeout (ms)
 
    Bluetooth phone app (pair with "DengeRobot"):
      W = forward   S = backward   A = left   D = right   L = stop
-
-   -----------------------------------------------------------------------
-   WHY THE BLUETOOTH DRIVING FELT BAD BEFORE (read this if things are still
-   not smooth after flashing this version) — see chat explanation as well:
-   -----------------------------------------------------------------------
-   1) The forward/backward "lean" used to ramp up by a FIXED AMOUNT PER LOOP
-      ITERATION instead of a fixed amount PER SECOND. Since loop speed is
-      not perfectly constant (sensor reads, BT reads, etc. all take a
-      variable amount of time), a short press vs a long press produced
-      very inconsistent results. This version ramps based on elapsed time
-      (dt), so the behaviour is now consistent no matter how fast the loop
-      runs. Tune the "feel" with r<value> / u<value> (ramp time in seconds)
-      instead of guessing at a per-loop step size.
-
-   2) BT_TIMEOUT (the "no command received -> stop" failsafe) was only
-      300 ms. Classic Bluetooth Serial can have latency spikes, and many
-      phone "pad" apps only resend the held key every 100-300 ms. If a
-      packet is a little late, the robot thinks the button was released
-      and snaps back to a zero lean target, which mid-drive can be enough
-      to tip an already marginally-tuned balance loop over. This is
-      raised to 600 ms by default and is now live-tunable with x<value>
-      so you can find the smallest safe value for your specific phone app.
-
-   3) The maximum forward/backward lean (MOVE_TILT_MAX) is only ~1 degree
-      by design — that's intentional and safe. If the robot falls as soon
-      as you start driving, the balance PID itself is likely tuned right
-      at the edge of stability (fine when sitting still, not fine once you
-      ask it to also track a moving target angle). Re-tune Kp/Ki/Kd with
-      the robot actually being nudged by hand before trusting BT driving,
-      and consider lowering m<value> even further (e.g. 0.3-0.5) while you
-      dial in the PID gains.
-
-   4) Fixed a bug where auto-trim adjusted "targetAngle" directly, but
-      targetAngle is recalculated from baseTargetAngle + moveTilt on every
-      single loop anyway — so the auto-trim correction was being silently
-      discarded every iteration. Auto-trim now correctly adjusts
-      baseTargetAngle instead.
    ========================================================================= */
 
 #include <Wire.h>
+
+#include "config.h"
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 #include "BluetoothSerial.h"
 
 Adafruit_MPU6050 mpu;
 BluetoothSerial SerialBT;
-
-// ---------------------------------------------------------------------------
-// L298N MOTOR DRIVER PINS
-// ---------------------------------------------------------------------------
-// ENA/ENB are the PWM speed pins, IN1..IN4 set direction for each motor.
-// Change these if your wiring is different.
-#define ENA 14
-#define IN1 27
-#define IN2 26
-#define ENB 12
-#define IN3 25
-#define IN4 33
-
-#define PWM_FREQ 1000   // PWM frequency for the motor driver (Hz)
-#define PWM_RES  8      // PWM resolution in bits (8-bit -> 0-255 duty range)
 
 // ---------------------------------------------------------------------------
 // LIVE-TUNABLE PID VALUES (balance controller)
@@ -173,19 +114,19 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
-  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(PIN_LEFT_IN1, OUTPUT); pinMode(PIN_LEFT_IN2, OUTPUT);
+  pinMode(PIN_RIGHT_IN1, OUTPUT); pinMode(PIN_RIGHT_IN2, OUTPUT);
 
   #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-    ledcAttach(ENA, PWM_FREQ, PWM_RES);
-    ledcAttach(ENB, PWM_FREQ, PWM_RES);
+    ledcAttach(PIN_LEFT_PWM, MOTOR_PWM_FREQ_HZ, MOTOR_PWM_BITS);
+    ledcAttach(PIN_RIGHT_PWM, MOTOR_PWM_FREQ_HZ, MOTOR_PWM_BITS);
   #else
-    ledcSetup(0, PWM_FREQ, PWM_RES); ledcAttachPin(ENA, 0);
-    ledcSetup(1, PWM_FREQ, PWM_RES); ledcAttachPin(ENB, 1);
+    ledcSetup(0, MOTOR_PWM_FREQ_HZ, MOTOR_PWM_BITS); ledcAttachPin(PIN_LEFT_PWM, 0);
+    ledcSetup(1, MOTOR_PWM_FREQ_HZ, MOTOR_PWM_BITS); ledcAttachPin(PIN_RIGHT_PWM, 1);
   #endif
 
-  Wire.begin(21, 22); // SDA=21, SCL=22 — change if your IMU is wired differently
-  if (!mpu.begin(0x68, &Wire)) {
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  if (!mpu.begin(IMU_I2C_ADDRESS, &Wire)) {
     Serial.println("ERROR: MPU6050 not found!");
     while (1) delay(10);
   }
@@ -221,8 +162,8 @@ void loop() {
   // and slowly correct with the accelerometer (noisy, but doesn't drift).
   // 0.96/0.04 is a common starting split; raise the gyro weight (e.g. 0.98)
   // for a smoother but slower-to-correct angle estimate.
-  double accAngle = atan2(a.acceleration.x, -a.acceleration.z) * 57.2957795;
-  double gyroRate = g.gyro.y * 57.2957795;
+  double accAngle = pitchFromAccel(a.acceleration.x, a.acceleration.y, a.acceleration.z);
+  double gyroRate = pitchRateFromGyro(g.gyro.x * RAD_TO_DEG, g.gyro.y * RAD_TO_DEG, g.gyro.z * RAD_TO_DEG);
   currentAngle = 0.96 * (currentAngle + gyroRate * dt) + 0.04 * accAngle;
 
   // Safety cutoff: if the robot has tipped over too far to recover
@@ -282,6 +223,12 @@ void loop() {
 // on the DIFFERENCE between them — so the two behaviors are fully
 // independent and turning never fights the balance PID.
 // ---------------------------------------------------------------------------
+// Positive direction drives in1 HIGH / in2 LOW; see the *_MOTOR_REVERSED flags.
+void setDirection(int in1, int in2, bool positive) {
+  digitalWrite(in1, positive ? HIGH : LOW);
+  digitalWrite(in2, positive ? LOW : HIGH);
+}
+
 void driveMotors(double output) {
   double leftCmd  = output + turnBias;
   double rightCmd = output - turnBias;
@@ -302,17 +249,12 @@ void driveMotors(double output) {
     speedR = constrain(speedR, 70, 230);
   }
 
-  // Left wheel direction (same polarity as the original IN1/IN2 wiring)
-  if (leftCmd < 0) { digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); }
-  else              { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);  }
-
-  // Right wheel direction (same polarity as the original IN3/IN4 wiring)
-  if (rightCmd < 0) { digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);  }
-  else               { digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); }
+  setDirection(PIN_LEFT_IN1, PIN_LEFT_IN2, (leftCmd >= 0) != LEFT_MOTOR_REVERSED);
+  setDirection(PIN_RIGHT_IN1, PIN_RIGHT_IN2, (rightCmd >= 0) != RIGHT_MOTOR_REVERSED);
 
   #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-    ledcWrite(ENA, speedL);
-    ledcWrite(ENB, speedR);
+    ledcWrite(PIN_LEFT_PWM, speedL);
+    ledcWrite(PIN_RIGHT_PWM, speedR);
   #else
     ledcWrite(0, speedL);
     ledcWrite(1, speedR);
@@ -320,10 +262,10 @@ void driveMotors(double output) {
 }
 
 void stopMotors() {
-  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  digitalWrite(PIN_LEFT_IN1, LOW); digitalWrite(PIN_LEFT_IN2, LOW);
+  digitalWrite(PIN_RIGHT_IN1, LOW); digitalWrite(PIN_RIGHT_IN2, LOW);
   #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-    ledcWrite(ENA, 0); ledcWrite(ENB, 0);
+    ledcWrite(PIN_LEFT_PWM, 0); ledcWrite(PIN_RIGHT_PWM, 0);
   #else
     ledcWrite(0, 0); ledcWrite(1, 0);
   #endif

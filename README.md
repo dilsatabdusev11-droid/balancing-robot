@@ -1,7 +1,7 @@
 # 🤖 ESP32 Self-Balancing Robot
 
 <p align="center">
-  <img src="demo.gif" alt="Kendini Dengeleyen Robot Tanıtımı" width="500">
+  <img src="docs/images/demo.gif" alt="Kendini Dengeleyen Robot Tanıtımı" width="500">
 </p>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -61,10 +61,9 @@ A two-wheeled inverted pendulum self-balancing robot built with an ESP32 microco
 
 | Part | File | Status |
 |:---|:---:|:---|
-| **TT Motor Holder ×2** | `tt_motor_tutucu.stl` | ✅ Included in this repo |
+| **TT Motor Holder ×2** | `hardware/stl/tt_motor_holder.stl` | ✅ Included in this repo |
 | **8×8×8 cm Enclosure + Lid** | — | ⚠️ Designed for this build but the source/STL was lost — not yet available. If re-created, it will be added here. |
 
-> **Suggested repo structure:** Place printable files under an `stl/` (or `hardware/`) folder so they are easy to locate separately from the firmware.
 
 ---
 
@@ -133,22 +132,23 @@ PID gains and control parameters can be tuned in real time over the USB Serial M
 ### 📐 Circuit Schematic
 
 <p align="center">
-  <img src="espcircuit.svg" alt="Hardware Circuit Schematic" width="650">
+  <img src="docs/images/espcircuit.svg" alt="Hardware Circuit Schematic" width="650">
 </p>
 
 ---
 
 ## 🚀 Getting Started
 
-1. Install the ESP32 board package in Arduino IDE (**Boards Manager** → search `esp32` → install). Select **ESP32 Dev Module** as the target board.
-2. Install required libraries via the Arduino Library Manager:
+1. Open `firmware/self_balancing_robot/self_balancing_robot.ino` in the Arduino IDE. Pins, motor directions and the IMU orientation are in `config.h` next to it.
+2. Install the ESP32 board package in Arduino IDE (**Boards Manager** → search `esp32` → install). Select **ESP32 Dev Module** as the target board.
+3. Install required libraries via the Arduino Library Manager:
    - `Adafruit MPU6050`
    - `Adafruit Unified Sensor`
    - `BluetoothSerial` (bundled with ESP32 core)
-3. Wire the hardware according to the pinout table above.
-4. Flash the firmware and open the Serial Monitor at **115200 baud**.
-5. Pair your phone's Bluetooth with the device named **`DengeRobot`** and connect using a pad-style BT controller app.
-6. Stand the robot upright, then tune $K_p$, $K_i$, $K_d$, and the base target angle live over Serial.
+4. Wire the hardware according to the pinout table above.
+5. Flash the firmware and open the Serial Monitor at **115200 baud**.
+6. Pair your phone's Bluetooth with the device named **`DengeRobot`** and connect using a pad-style BT controller app.
+7. Stand the robot upright, then tune $K_p$, $K_i$, $K_d$, and the base target angle live over Serial.
 
 ---
 
@@ -156,7 +156,7 @@ PID gains and control parameters can be tuned in real time over the USB Serial M
 
 Real issues encountered during this build, documented to accelerate future revisions:
 
-- **Reversed Motor Wiring (Compensated in Software):** The two TT motors were initially wired with opposite polarity, preventing the platform from achieving equilibrium (one wheel continuously opposed balance). Rather than desoldering hardware leads, polarity inversion was mapped directly inside `driveMotors()` in firmware.
+- **Reversed Motor Wiring (Compensated in Software):** The two TT motors were initially wired with opposite polarity, preventing the platform from achieving equilibrium (one wheel continuously opposed balance). Rather than desoldering hardware leads, polarity inversion is set with the `*_MOTOR_REVERSED` flags in `config.h`.
 - **Inverted MPU-6050 Mounting Orientation:** Mounting the IMU onto the top lid inverted the sign of raw tilt angles. Ensure coordinate system alignment is verified early—sign mismatches cause PID feedback and auto-trim loops to amplify tilt rather than correct it.
 - **Empirical PID Tuning Strategy:** Tuning required establishing wide discrete test bounds rather than micro-adjustments:
   - **$K_p$:** Test in coarse intervals (`3, 6, 9, 12, 15, 18`) to quickly identify the stability threshold.
