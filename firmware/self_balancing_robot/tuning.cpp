@@ -35,6 +35,7 @@ void printHelp(Print& out) {
   out.println("  calib            re-measure the gyro offset (stop first, keep still)");
   out.println("  motortest        spin left then right wheel forward (stop, wheels in air)");
   out.println("  encoders         wheel encoder counts since the last call (direction check)");
+  out.println("  log 0|1|2        status output: off / text / Serial Plotter graph");
   out.println("  help             this list");
 }
 

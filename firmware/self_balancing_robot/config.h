@@ -8,6 +8,23 @@
 #include <stdint.h>
 
 // ---------------------------------------------------------------------------
+// Phone remote
+// ---------------------------------------------------------------------------
+// REMOTE_BLUETOOTH: classic Bluetooth, Android pad apps. Only the original
+//   ESP32 has it (not S2/S3/C3/C6), and ESP32 core 4.x drops it by default.
+// REMOTE_WIFI: the robot creates its own Wi-Fi network with a control page
+//   for any phone browser, iPhone included. Works on every ESP32.
+#define REMOTE_BLUETOOTH 1
+#define REMOTE_WIFI 2
+#ifndef REMOTE_MODE
+#define REMOTE_MODE REMOTE_BLUETOOTH
+#endif
+// Each robot is named <prefix>-XXXX from its own chip ID, so a class full of
+// robots does not show ten identical names.
+constexpr const char* ROBOT_NAME_PREFIX = "BalanceBot";
+constexpr const char* WIFI_PASSWORD = "robot1234";  // 8+ characters (REMOTE_WIFI)
+
+// ---------------------------------------------------------------------------
 // Motor driver pins (L298N or TB6612FNG)
 // ---------------------------------------------------------------------------
 constexpr int PIN_LEFT_PWM = 14;   // L298N ENA / TB6612 PWMA

@@ -1,15 +1,15 @@
 /* =============================================================================
-   SELF-BALANCING ROBOT - MPU6050 + L298N + PID + Bluetooth (ESP32)
+   SELF-BALANCING ROBOT - MPU6050 + L298N/TB6612 + PID + phone remote (ESP32)
    =============================================================================
    Balances a two-wheeled robot with a PID controller fed by an MPU6050 IMU and
-   lets you drive it from a phone over classic Bluetooth Serial (for example the
-   "Arduino Bluetooth Controller" app in pad mode).
+   lets you drive it from a phone: classic Bluetooth with a pad app, or a Wi-Fi
+   web page (REMOTE_MODE in config.h).
 
-   Robot-specific settings (pins, motor directions, IMU orientation) live in
-   config.h. Tunable values are changed over USB Serial (115200 baud): type
-   "help" for the command list and "save" to keep them after a reboot.
+   Robot-specific settings (pins, motor directions, IMU orientation, remote)
+   live in config.h. Tunable values are changed over USB Serial (115200 baud):
+   type "help" for the command list and "save" to keep them after a reboot.
 
-   Bluetooth phone app (pair with "DengeRobot"):
+   Phone commands (the robot's name is BalanceBot-XXXX, printed at boot):
      W = forward   S = backward   A = left   D = right   L = stop driving
      X = emergency stop (motors off)   G = go (allow balancing again)
 
@@ -18,7 +18,6 @@
 
 #include <Wire.h>
 
-#include "BluetoothSerial.h"
 #include "balance.h"
 #include "battery.h"
 #include "command.h"
@@ -28,11 +27,11 @@
 #include "encoders.h"
 #include "imu.h"
 #include "motors.h"
+#include "remote.h"
 #include "settings.h"
 #include "settings_store.h"
 #include "tuning.h"
 
-BluetoothSerial SerialBT;
 Mpu6050 imu;
 
 // Live-tunable values (gains, base angle, drive limits). See settings.h for
@@ -76,7 +75,7 @@ SpeedLoop speedLoop;
 float wantedSpeed = 0.0f;  // m/s, ramped toward the phone command
 float speedLean = 0.0f;    // lean the speed loop asks for, deg
 
-// --- Bluetooth drive control ------------------------------------------------
+// --- Phone drive control ----------------------------------------------------
 // Driving forward/backward gently LEANS the balance target angle; the balance
 // PID then rolls the wheels to chase that lean, which gives smooth
 // acceleration. With encoders the phone sets a speed instead and the speed
@@ -85,8 +84,12 @@ float speedLean = 0.0f;    // lean the speed loop asks for, deg
 float moveTilt = 0.0f;  // current forward/backward lean added to baseAngle
 float turnBias = 0.0f;  // current left/right wheel speed difference
 
-char btCommand = 'L';
-uint32_t lastBtCommandMs = 0;
+char driveCommand = 'L';  // last W/S/A/D/L from the phone
+uint32_t lastDriveCommandMs = 0;
+
+// --- Serial status output ("log 0/1/2") ------------------------------------------
+enum class LogMode { Off, Text, Plotter };
+LogMode logMode = LogMode::Text;
 
 // --- Fixed-rate control loop ------------------------------------------------
 uint32_t lastControlUs = 0;
@@ -119,13 +122,12 @@ void setup() {
   }
   startGyroCalibration();
 
-  SerialBT.begin("DengeRobot");  // Bluetooth device name - pair your phone to this
-  Serial.println("Bluetooth is active. Pair your phone with 'DengeRobot'.");
+  remoteBegin(robotName(), handleRemoteCommand);
 
   Serial.println("\n=== Self-Balancing Robot Started ===");
   printHelp(Serial);
-  Serial.println("Bluetooth commands: W forward, S backward, A left, D right, L stop driving,");
-  Serial.println("                    X emergency stop, G go");
+  Serial.println("Phone commands: W forward, S backward, A left, D right, L stop driving,");
+  Serial.println("                X emergency stop, G go");
 
   lastControlUs = micros();
   nextControlUs = lastControlUs + CONTROL_PERIOD_US;
@@ -134,7 +136,8 @@ void setup() {
 void loop() {
   // Everything here returns immediately; only the control step is timed.
   readSerialCommands();
-  readBluetoothCommands();
+  remotePoll({stateName(arming.state), currentAngle, wheelSpeed.speed, batteryVolts()});
+  checkRemoteTimeout();
   batteryPoll();
 
   const uint32_t now = micros();
@@ -214,7 +217,7 @@ void controlStep(float dt) {
                          kMaxCommand);
   motorsDrive(pidOutput - turnBias, pidOutput + turnBias, batteryCompensation());
   // With encoders the speed loop's integral already finds the balance point.
-  autoTrim.update(pidOutput, dt, settings.autoTrim && !ENCODERS_ENABLED && btCommand == 'L',
+  autoTrim.update(pidOutput, dt, settings.autoTrim && !ENCODERS_ENABLED && driveCommand == 'L',
                   AUTOTRIM_RATE, AUTOTRIM_AVERAGE_S, AUTOTRIM_LIMIT_DEG);
 }
 
@@ -276,145 +279,72 @@ void runGyroCalibration(float rawRate) {
 
 void logStatus() {
   static uint32_t lastLogMs = 0;
-  if (millis() - lastLogMs < 100) return;
+  const uint32_t period = logMode == LogMode::Plotter ? 50 : 100;
+  if (logMode == LogMode::Off || millis() - lastLogMs < period) return;
   lastLogMs = millis();
+  if (logMode == LogMode::Plotter) {
+    // Arduino IDE Serial Plotter format: name:value pairs, one line per sample.
+    Serial.printf("angle:%.2f,target:%.2f,output:%.1f,rate:%.1f,speed:%.2f,battery:%.2f\n",
+                  currentAngle, targetAngle, pidOutput / 10.0f, pitchRate / 10.0f,
+                  wheelSpeed.speed, batteryVolts());
+    return;
+  }
   Serial.printf("%s | Angle: %.2f | Target: %.2f | Trim: %.2f | PID: %.2f | Speed: %.2f\n",
                 stateName(arming.state), currentAngle, targetAngle, autoTrim.offset, pidOutput,
                 wheelSpeed.speed);
 }
 
 // ---------------------------------------------------------------------------
-// USB Serial commands. Characters are collected into a line without waiting,
-// so typing a command never pauses the balance loop (Serial.parseFloat()
-// used to block for up to 1 s and the robot fell over).
+// Phone commands. A pad app (or the web page) repeats the held key while it is
+// pressed and sends 'L' on release. The last drive command is kept; if nothing
+// arrives for remoteTimeoutMs it counts as released.
 // ---------------------------------------------------------------------------
-void handleCommandLine(const char* line) {
-  Command cmd;
-  switch (parseCommand(line, cmd)) {
-    case ParseStatus::Empty: return;
-    case ParseStatus::BadName:
-    case ParseStatus::BadValue:
-      Serial.printf("! Cannot understand '%s'. Type 'help'.\n", line);
-      return;
-    case ParseStatus::Ok: break;
-  }
-
-  if (handleActionCommand(cmd.name)) return;
-
-  // "save" keeps the learned auto-trim correction as part of baseAngle.
-  if (strcmp(cmd.name, "save") == 0) {
-    settings.baseAngle = clampf(settings.baseAngle + autoTrim.offset, -45.0f, 45.0f);
-    autoTrim.reset();
-  }
-  const float oldKi = settings.ki;
-  const float oldBase = settings.baseAngle;
-  const bool oldAutoTrim = settings.autoTrim;
-  if (!handleSettingsCommand(cmd, settings, Serial)) {
-    Serial.printf("! Unknown command '%s'. Type 'help'.\n", cmd.name);
-    return;
-  }
-  if (settings.ki != oldKi) pid.reset();  // a big Ki change must not cause a kick
-  if (settings.baseAngle != oldBase || settings.autoTrim != oldAutoTrim) autoTrim.reset();
-}
-
-// Commands that act on the robot rather than change a setting.
-bool handleActionCommand(const char* name) {
-  const bool balancing = arming.state == RobotState::Balancing;
-  if (strcmp(name, "stop") == 0) {
-    requestStop(true);
-  } else if (strcmp(name, "go") == 0) {
-    requestStop(false);
-  } else if (strcmp(name, "calib") == 0) {
-    if (balancing) {
-      Serial.println("! Stop the robot first ('stop'), then 'calib'.");
-    } else {
-      startGyroCalibration();
-    }
-  } else if (strcmp(name, "zero") == 0) {
-    if (balancing) {
-      Serial.println("! Stop the robot first ('stop'), hold it at its balance point, then 'zero'.");
-    } else {
-      settings.baseAngle = clampf(currentAngle, -45.0f, 45.0f);
-      autoTrim.reset();
-      Serial.printf("-> base = %.2f (current angle). Type 'save' to keep it.\n", settings.baseAngle);
-    }
-  } else if (strcmp(name, "encoders") == 0) {
-    if (!ENCODERS_ENABLED) {
-      Serial.println("! Encoders are off: set ENCODERS_ENABLED in config.h.");
-    } else {
-      int32_t left = 0, right = 0;
-      encodersReadTotals(left, right);
-      Serial.printf("-> Counts since last check: left %ld, right %ld (one wheel turn = %.0f).\n",
-                    static_cast<long>(left), static_cast<long>(right), ENCODER_COUNTS_PER_WHEEL_REV);
-      Serial.println("   Roll the robot FORWARD and check again: both must be positive.");
-    }
-  } else if (strcmp(name, "motortest") == 0) {
-    if (balancing) {
-      Serial.println("! Stop the robot first ('stop') and hold it with the wheels in the air.");
-    } else {
-      Serial.println("-> Motor test: left wheel, pause, right wheel.");
-      motorTest.start();
-    }
-  } else {
-    return false;
-  }
-  return true;
-}
-
-void requestStop(bool stop) {
-  if (stop == stopRequested) return;
-  stopRequested = stop;
-  Serial.println(stop ? "-> Emergency stop: motors off. 'go' (or G on the phone) to continue."
-                      : "-> Go: hold the robot upright to start balancing.");
-}
-
-void readSerialCommands() {
-  while (Serial.available() > 0) {
-    switch (serialLine.push(static_cast<char>(Serial.read()))) {
-      case LineStatus::Ready: handleCommandLine(serialLine.line()); break;
-      case LineStatus::Overflow: Serial.println("! Line too long, ignored."); break;
-      case LineStatus::Pending: break;
-    }
+void handleRemoteCommand(char command) {
+  switch (command) {
+    case 'W':
+    case 'S':
+    case 'A':
+    case 'D':
+    case 'L':
+      driveCommand = command;
+      lastDriveCommandMs = millis();
+      break;
+    case 'X': requestStop(true); break;
+    case 'G': requestStop(false); break;
+    default: break;  // apps also send other characters: ignore them
   }
 }
 
-// ---------------------------------------------------------------------------
-// Bluetooth drive commands. A pad-style phone app re-sends the held key while
-// it is pressed and sends 'L' on release. The last recognised command is kept;
-// if nothing valid arrives for remoteTimeoutMs, it counts as released.
-// ---------------------------------------------------------------------------
-void readBluetoothCommands() {
-  while (SerialBT.available() > 0) {
-    const char c = static_cast<char>(toupper(SerialBT.read()));
-    if (c == 'W' || c == 'S' || c == 'A' || c == 'D' || c == 'L') {
-      btCommand = c;
-      lastBtCommandMs = millis();
-    } else if (c == 'X') {
-      requestStop(true);
-    } else if (c == 'G') {
-      requestStop(false);
-    }
+void checkRemoteTimeout() {
+  if (millis() - lastDriveCommandMs > settings.remoteTimeoutMs) {
+    driveCommand = 'L';  // connection dropped or button released: stop driving
   }
-  if (millis() - lastBtCommandMs > settings.remoteTimeoutMs) {
-    btCommand = 'L';  // connection dropped or button released: stop driving
-  }
+}
+
+// BalanceBot-XXXX, XXXX = last two bytes of this chip's MAC address.
+const char* robotName() {
+  static char name[32];
+  const uint64_t mac = ESP.getEfuseMac();
+  snprintf(name, sizeof(name), "%s-%02X%02X", ROBOT_NAME_PREFIX,
+           static_cast<unsigned>((mac >> 32) & 0xFF), static_cast<unsigned>((mac >> 40) & 0xFF));
+  return name;
 }
 
 // Ramps the drive lean and the turn offset toward the current command at a
 // constant rate per second, so the balance loop is never jolted.
 void updateDriveRamps(float dt) {
   float tiltTarget = 0.0f;
-  if (btCommand == 'W') tiltTarget = settings.moveTiltMax;
-  else if (btCommand == 'S') tiltTarget = -settings.moveTiltMax;
+  if (driveCommand == 'W') tiltTarget = settings.moveTiltMax;
+  else if (driveCommand == 'S') tiltTarget = -settings.moveTiltMax;
   moveTilt = rampToward(moveTilt, tiltTarget, settings.moveTiltMax / settings.tiltRampTime * dt);
 
   float speedTarget = 0.0f;
-  if (btCommand == 'W') speedTarget = settings.maxSpeed;
-  else if (btCommand == 'S') speedTarget = -settings.maxSpeed;
+  if (driveCommand == 'W') speedTarget = settings.maxSpeed;
+  else if (driveCommand == 'S') speedTarget = -settings.maxSpeed;
   wantedSpeed = rampToward(wantedSpeed, speedTarget, settings.maxSpeed / settings.tiltRampTime * dt);
 
   float turnTarget = 0.0f;
-  if (btCommand == 'D') turnTarget = settings.turnMax;
-  else if (btCommand == 'A') turnTarget = -settings.turnMax;
+  if (driveCommand == 'D') turnTarget = settings.turnMax;
+  else if (driveCommand == 'A') turnTarget = -settings.turnMax;
   turnBias = rampToward(turnBias, turnTarget, settings.turnMax / settings.turnRampTime * dt);
 }
