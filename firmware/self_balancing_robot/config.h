@@ -90,7 +90,7 @@ constexpr float GYRO_STILL_SPREAD_DPS = 2.0f;  // more spread = robot moved, ret
 // Pitch angle (degrees) from the accelerometer and pitch rate (deg/s) from the
 // gyro. These match an MPU-6050 mounted upside down on the lid. If your board
 // sits differently, pick the axes so that BOTH values grow when the robot tilts
-// the same way (see README, "First start").
+// the same way (README, first start, step 2).
 inline float pitchFromAccel(float ax, float ay, float az) {
   (void)ay;
   return atan2f(ax, -az) * 57.2957795f;

@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host-tests:
+    name: Unit tests (host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run
+        run: tests/host/run.sh
+
+  firmware:
+    name: Firmware (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ESP32, Bluetooth
+            fqbn: esp32:esp32:esp32
+            flags: ""
+          - name: ESP32, Wi-Fi
+            fqbn: esp32:esp32:esp32
+            flags: "-DREMOTE_MODE=2"
+          - name: ESP32-S3, Wi-Fi
+            fqbn: esp32:esp32:esp32s3
+            flags: "-DREMOTE_MODE=2"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/compile-sketches@v1
+        with:
+          fqbn: ${{ matrix.fqbn }}
+          platforms: |
+            - name: esp32:esp32
+              source-url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+              version: 3.3.12
+          sketch-paths: |
+            - firmware/self_balancing_robot
+          cli-compile-flags: |
+            - --warnings
+            - all
+            - --build-property
+            - compiler.cpp.extra_flags=${{ matrix.flags }}

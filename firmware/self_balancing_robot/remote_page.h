@@ -10,7 +10,7 @@ constexpr const char kRemotePage[] = R"HTML(<!doctype html>
 <style>
 body{font-family:sans-serif;text-align:center;margin:0;padding:16px;background:#111;color:#eee;
   user-select:none;-webkit-user-select:none;touch-action:none}
-#status{font-size:16px;line-height:1.5;min-height:3em}
+#status{font-size:16px;line-height:1.5;min-height:3em;white-space:pre-line}
 .pad{display:grid;grid-template-columns:repeat(3,88px);grid-template-rows:repeat(3,88px);
   gap:12px;justify-content:center;margin:24px auto}
 button{font-size:30px;border:0;border-radius:16px;background:#333;color:#fff}
@@ -57,8 +57,8 @@ async function poll() {
   const status = document.getElementById('status');
   try {
     const s = await (await fetch('/status')).json();
-    status.textContent = s.state + ' | angle ' + s.angle.toFixed(1) + '° | speed ' +
-      s.speed.toFixed(2) + ' m/s | ' + (s.battery > 0 ? s.battery.toFixed(2) + ' V' : 'battery: n/a');
+    status.textContent = s.state + '\nangle ' + s.angle.toFixed(1) + '\u00b0 \u00b7 ' +
+      s.speed.toFixed(2) + ' m/s \u00b7 ' + (s.battery > 0 ? s.battery.toFixed(2) + ' V' : 'battery n/a');
   } catch (e) {
     status.textContent = 'no connection to the robot';
   }
