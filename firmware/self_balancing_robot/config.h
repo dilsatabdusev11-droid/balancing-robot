@@ -8,22 +8,45 @@
 #include <stdint.h>
 
 // ---------------------------------------------------------------------------
-// Motor driver pins (L298N)
+// Motor driver pins (L298N or TB6612FNG)
 // ---------------------------------------------------------------------------
-constexpr int PIN_LEFT_PWM = 14;   // ENA
-constexpr int PIN_LEFT_IN1 = 27;   // IN1
-constexpr int PIN_LEFT_IN2 = 26;   // IN2
-constexpr int PIN_RIGHT_PWM = 12;  // ENB
-constexpr int PIN_RIGHT_IN1 = 25;  // IN3
-constexpr int PIN_RIGHT_IN2 = 33;  // IN4
+constexpr int PIN_LEFT_PWM = 14;   // L298N ENA / TB6612 PWMA
+constexpr int PIN_LEFT_IN1 = 27;   // L298N IN1 / TB6612 AIN1
+constexpr int PIN_LEFT_IN2 = 26;   // L298N IN2 / TB6612 AIN2
+// Was GPIO12 in the original build. GPIO12 is a boot strapping pin: if the
+// driver pulls it HIGH while the ESP32 resets, the board does not start.
+constexpr int PIN_RIGHT_PWM = 13;  // L298N ENB / TB6612 PWMB
+constexpr int PIN_RIGHT_IN1 = 25;  // L298N IN3 / TB6612 BIN1
+constexpr int PIN_RIGHT_IN2 = 33;  // L298N IN4 / TB6612 BIN2
+// TB6612FNG only: its STBY pin. -1 when STBY is wired straight to 3.3 V or
+// when using an L298N.
+constexpr int PIN_MOTOR_STBY = -1;
 
 constexpr uint32_t MOTOR_PWM_FREQ_HZ = 1000;
 constexpr uint8_t MOTOR_PWM_BITS = 8;  // 8 bits -> duty 0..255
+// Duty that just gets the motors turning (static friction), duty at full
+// command, and the command (0..100) at which MOTOR_PWM_MIN is reached.
+constexpr int MOTOR_PWM_MIN = 70;
+constexpr int MOTOR_PWM_MAX = 230;
+constexpr float MOTOR_START_COMMAND = 2.0f;
 
-// Motor direction. A positive command drives IN1 (IN3) HIGH and IN2 (IN4) LOW;
-// a reversed motor gets the opposite. Flip a flag instead of re-soldering.
-constexpr bool LEFT_MOTOR_REVERSED = false;
-constexpr bool RIGHT_MOTOR_REVERSED = true;
+// Motor direction. A positive (forward) command drives IN1 HIGH and IN2 LOW;
+// a reversed motor gets the opposite. "Forward" is the side the robot leans
+// to when the measured angle grows. Check with the "motortest" command and
+// flip a flag instead of re-soldering.
+constexpr bool LEFT_MOTOR_REVERSED = true;
+constexpr bool RIGHT_MOTOR_REVERSED = false;
+
+// ---------------------------------------------------------------------------
+// Battery monitor (optional): pack+ -> R1 -> GPIO34 -> R2 -> GND
+// ---------------------------------------------------------------------------
+// Enable only after wiring the divider: an unconnected pin reads garbage.
+constexpr bool BATTERY_MONITOR_ENABLED = false;
+constexpr int PIN_BATTERY_SENSE = 34;                              // input-only ADC pin
+constexpr float BATTERY_DIVIDER_RATIO = (100.0f + 47.0f) / 47.0f;  // R1 = 100k, R2 = 47k
+constexpr float BATTERY_NOMINAL_VOLTS = 7.4f;  // 2S Li-ion
+constexpr float BATTERY_CUTOFF_VOLTS = 6.4f;   // 3.2 V per cell: stop the motors
+constexpr float BATTERY_RESUME_VOLTS = 6.8f;   // run again after charging
 
 // ---------------------------------------------------------------------------
 // IMU (MPU-6050) wiring and orientation

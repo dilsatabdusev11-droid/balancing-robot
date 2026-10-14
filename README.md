@@ -125,7 +125,7 @@ PID gains and control parameters can be tuned in real time over the USB Serial M
 | **MPU-6050** | SCL | GPIO 22 | I2C Clock |
 | **L298N Driver** | ENA | GPIO 14 | Left Motor PWM Speed |
 | **L298N Driver** | IN1 / IN2 | GPIO 27 / GPIO 26 | Left Motor Direction Pins |
-| **L298N Driver** | ENB | GPIO 12 | Right Motor PWM Speed |
+| **L298N Driver** | ENB | GPIO 13 | Right Motor PWM Speed (moved from GPIO 12, a boot strapping pin) |
 | **L298N Driver** | IN3 / IN4 | GPIO 25 / GPIO 33 | Right Motor Direction Pins |
 | **Power / Ground** | GND | GND | Common ground reference across all modules |
 

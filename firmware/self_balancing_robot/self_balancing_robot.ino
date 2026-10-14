@@ -15,8 +15,10 @@
 
 #include <Wire.h>
 
+#include "battery.h"
 #include "config.h"
 #include "command.h"
+#include "motors.h"
 #include "settings.h"
 #include "settings_store.h"
 #include "tuning.h"
@@ -80,8 +82,6 @@ unsigned long lastBtCommandTime = 0;
 // assume the connection dropped or the button was released, and stop.
 // ===========================================================================
 
-void driveMotors(double output);
-void stopMotors();
 void readSerialCommands();
 void readBluetoothCommands();
 
@@ -95,16 +95,8 @@ void setup() {
     Serial.println("No saved settings, using defaults.");
   }
 
-  pinMode(PIN_LEFT_IN1, OUTPUT); pinMode(PIN_LEFT_IN2, OUTPUT);
-  pinMode(PIN_RIGHT_IN1, OUTPUT); pinMode(PIN_RIGHT_IN2, OUTPUT);
-
-  #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-    ledcAttach(PIN_LEFT_PWM, MOTOR_PWM_FREQ_HZ, MOTOR_PWM_BITS);
-    ledcAttach(PIN_RIGHT_PWM, MOTOR_PWM_FREQ_HZ, MOTOR_PWM_BITS);
-  #else
-    ledcSetup(0, MOTOR_PWM_FREQ_HZ, MOTOR_PWM_BITS); ledcAttachPin(PIN_LEFT_PWM, 0);
-    ledcSetup(1, MOTOR_PWM_FREQ_HZ, MOTOR_PWM_BITS); ledcAttachPin(PIN_RIGHT_PWM, 1);
-  #endif
+  motorsBegin();
+  batteryBegin();
 
   Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
   if (!mpu.begin(IMU_I2C_ADDRESS, &Wire)) {
@@ -134,6 +126,7 @@ void loop() {
   lastTime = now;
 
   readSerialCommands();
+  batteryPoll();
   readBluetoothCommands(); // uses dt above to ramp moveTilt/turnBias smoothly
 
   sensors_event_t a, g, temp;
@@ -151,12 +144,14 @@ void loop() {
   // (e.g. picked up, or already fallen), stop the motors instead of
   // fighting the ground, and reset the integral/derivative state so it
   // doesn't lurch when picked back up.
-  if (abs(currentAngle - targetAngle) > 30.0) {
-    stopMotors();
+  if (abs(currentAngle - targetAngle) > 30.0 || batteryLow()) {
+    motorsStop();
     integral = 0;
     prevError = 0;
   } else {
-    error = targetAngle - currentAngle;
+    // Positive error = leaning forward past the target, and a positive output
+    // drives forward: the wheels roll under the falling body.
+    error = currentAngle - targetAngle;
 
     integral += error * dt;
     integral = constrain(integral, -60.0, 60.0); // anti-windup clamp
@@ -165,7 +160,9 @@ void loop() {
     prevError = error;
 
     pidOutput = (settings.kp * error) + (settings.ki * integral) + (settings.kd * derivative);
-    driveMotors(pidOutput);
+    // Turning adds opposite offsets to the two wheels around the shared
+    // balance output, so it changes yaw only, never pitch.
+    motorsDrive(pidOutput - turnBias, pidOutput + turnBias, batteryCompensation());
 
     // --- AUTO-TRIM ---
     // Track a very slow rolling average of pidOutput. If the robot is
@@ -176,7 +173,7 @@ void loop() {
     outputAvg = outputAvg * 0.999 + pidOutput * 0.001;
 
     if (settings.autoTrim) {
-      settings.baseAngle -= outputAvg * trimRate;
+      settings.baseAngle += outputAvg * trimRate;
       // NOTE: if this makes drift WORSE instead of better, your motor/
       // mounting orientation needs the opposite sign — change the line
       // above to "+=".
@@ -196,60 +193,6 @@ void loop() {
   }
 
   delay(4);
-}
-
-// ---------------------------------------------------------------------------
-// Drives each wheel independently. Pitch (front/back balance) depends on
-// the AVERAGE of the two wheels' commanded speed, while turning depends
-// on the DIFFERENCE between them — so the two behaviors are fully
-// independent and turning never fights the balance PID.
-// ---------------------------------------------------------------------------
-// Positive direction drives in1 HIGH / in2 LOW; see the *_MOTOR_REVERSED flags.
-void setDirection(int in1, int in2, bool positive) {
-  digitalWrite(in1, positive ? HIGH : LOW);
-  digitalWrite(in2, positive ? LOW : HIGH);
-}
-
-void driveMotors(double output) {
-  double leftCmd  = output + turnBias;
-  double rightCmd = output - turnBias;
-
-  int speedL = 0, speedR = 0;
-
-  // Motors need a minimum PWM value to actually overcome friction and
-  // start turning ("deadzone"). 70 is the minimum "starts moving" duty
-  // cycle and 230 is the practical top speed (out of 255) — adjust these
-  // two numbers to match your specific motors if they stall or are too
-  // fast/slow near the limits.
-  if (abs(leftCmd) >= 0.05) {
-    speedL = map((int)abs(leftCmd), 0, 100, 70, 230);
-    speedL = constrain(speedL, 70, 230);
-  }
-  if (abs(rightCmd) >= 0.05) {
-    speedR = map((int)abs(rightCmd), 0, 100, 70, 230);
-    speedR = constrain(speedR, 70, 230);
-  }
-
-  setDirection(PIN_LEFT_IN1, PIN_LEFT_IN2, (leftCmd >= 0) != LEFT_MOTOR_REVERSED);
-  setDirection(PIN_RIGHT_IN1, PIN_RIGHT_IN2, (rightCmd >= 0) != RIGHT_MOTOR_REVERSED);
-
-  #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-    ledcWrite(PIN_LEFT_PWM, speedL);
-    ledcWrite(PIN_RIGHT_PWM, speedR);
-  #else
-    ledcWrite(0, speedL);
-    ledcWrite(1, speedR);
-  #endif
-}
-
-void stopMotors() {
-  digitalWrite(PIN_LEFT_IN1, LOW); digitalWrite(PIN_LEFT_IN2, LOW);
-  digitalWrite(PIN_RIGHT_IN1, LOW); digitalWrite(PIN_RIGHT_IN2, LOW);
-  #if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
-    ledcWrite(PIN_LEFT_PWM, 0); ledcWrite(PIN_RIGHT_PWM, 0);
-  #else
-    ledcWrite(0, 0); ledcWrite(1, 0);
-  #endif
 }
 
 // ---------------------------------------------------------------------------
