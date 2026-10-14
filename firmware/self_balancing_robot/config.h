@@ -89,3 +89,16 @@ inline float pitchRateFromGyro(float gx, float gy, float gz) {
 // ---------------------------------------------------------------------------
 constexpr uint32_t CONTROL_PERIOD_US = 5000;  // 200 Hz
 constexpr float FALL_ANGLE_DEG = 30.0f;       // beyond this the robot has fallen
+// The motors start only after the robot is held within ARM_ANGLE_DEG of
+// upright for ARM_HOLD_S seconds (after boot, a fall or "stop"/"go").
+constexpr float ARM_ANGLE_DEG = 5.0f;
+constexpr float ARM_HOLD_S = 0.5f;
+constexpr float PID_INTEGRAL_LIMIT = 60.0f;   // anti-windup clamp (deg * s)
+
+// Auto-trim ("autotrim 1"): how fast it moves the upright angle (deg/s per
+// unit of average output), how long it averages, and how far it may go.
+constexpr float AUTOTRIM_RATE = 0.01f;
+constexpr float AUTOTRIM_AVERAGE_S = 5.0f;
+constexpr float AUTOTRIM_LIMIT_DEG = 2.0f;
+
+constexpr float MOTOR_TEST_COMMAND = 35.0f;   // "motortest" strength, 0..100

@@ -10,16 +10,21 @@
    "help" for the command list and "save" to keep them after a reboot.
 
    Bluetooth phone app (pair with "DengeRobot"):
-     W = forward   S = backward   A = left   D = right   L = stop
+     W = forward   S = backward   A = left   D = right   L = stop driving
+     X = emergency stop (motors off)   G = go (allow balancing again)
+
+   The motors start only after the robot is held upright for half a second.
    ========================================================================= */
 
 #include <Wire.h>
 
 #include "BluetoothSerial.h"
+#include "balance.h"
 #include "battery.h"
 #include "command.h"
 #include "config.h"
 #include "control.h"
+#include "drive_math.h"
 #include "imu.h"
 #include "motors.h"
 #include "settings.h"
@@ -53,17 +58,15 @@ float currentAngle = 0.0f;  // filtered tilt angle, deg
 float pitchRate = 0.0f;     // bias-corrected tilt rate, deg/s
 float targetAngle = 0.0f;   // angle the PID is chasing right now
 
-// --- Balance PID ------------------------------------------------------------
-float error = 0.0f, prevError = 0.0f;
-float integral = 0.0f;
+// --- Balance ----------------------------------------------------------------
+BalancePid pid;
+AutoTrim autoTrim;  // learns a small correction of baseAngle (see balance.h)
+Arming arming;      // decides when the motors may run
+MotorTest motorTest;
+bool stopRequested = false;  // emergency stop from Serial ("stop") or the phone (X)
 float pidOutput = 0.0f;
 
-// --- Auto-trim (drift correction) -------------------------------------------
-// If the robot consistently drifts one way while "balanced", baseAngle is not
-// quite the real balance point. Auto-trim watches the long-term average PID
-// output and, if enabled, slowly nudges baseAngle to make it zero.
-const float trimRate = 0.0005f;  // per control step. Keep VERY small.
-float outputAvg = 0.0f;          // slow rolling average of pidOutput
+constexpr ArmingConfig kArmingConfig = {ARM_ANGLE_DEG, ARM_HOLD_S, FALL_ANGLE_DEG};
 
 // --- Bluetooth drive control ------------------------------------------------
 // Driving forward/backward gently LEANS the balance target angle; the balance
@@ -111,7 +114,8 @@ void setup() {
 
   Serial.println("\n=== Self-Balancing Robot Started ===");
   printHelp(Serial);
-  Serial.println("Bluetooth commands: W forward, S backward, A left, D right, L stop");
+  Serial.println("Bluetooth commands: W forward, S backward, A left, D right, L stop driving,");
+  Serial.println("                    X emergency stop, G go");
 
   lastControlUs = micros();
   nextControlUs = lastControlUs + CONTROL_PERIOD_US;
@@ -138,59 +142,69 @@ void loop() {
 }
 
 // ---------------------------------------------------------------------------
-// One 200 Hz control step: read the IMU, estimate the angle, run the PID.
+// One 200 Hz control step: read the IMU, estimate the angle, decide whether
+// the motors may run, run the PID.
 // ---------------------------------------------------------------------------
 void controlStep(float dt) {
   ImuSample sample;
-  switch (readImu(sample)) {
-    case ImuRead::Ok: break;
-    case ImuRead::Skip: return;  // one glitch: keep the last motor command
-    case ImuRead::Fault:
-      motorsStop();
-      resetBalance();
-      return;
+  const ImuRead imuStatus = readImu(sample);
+  if (imuStatus == ImuRead::Skip) return;  // one glitch: keep the last motor command
+
+  if (imuStatus == ImuRead::Ok) {
+    const float rawRate = pitchRateFromGyro(sample.gx, sample.gy, sample.gz);
+    if (calibratingGyro) {
+      runGyroCalibration(rawRate);
+    } else {
+      pitchRate = rawRate - gyroBias;
+      currentAngle = tiltFilter.update(pitchFromAccel(sample.ax, sample.ay, sample.az), pitchRate,
+                                       dt, IMU_FILTER_TIME_CONSTANT_S);
+    }
   }
 
-  const float rawRate = pitchRateFromGyro(sample.gx, sample.gy, sample.gz);
-  if (calibratingGyro) {
-    motorsStop();
-    runGyroCalibration(rawRate);
+  updateDriveRamps(dt);
+  const float uprightAngle = settings.baseAngle + autoTrim.offset;
+  targetAngle = uprightAngle + moveTilt;
+
+  const RobotState previous = arming.state;
+  const ArmingInputs inputs = {imuStatus == ImuRead::Ok, calibratingGyro,
+                               stopRequested || motorTest.running(), batteryLow(),
+                               currentAngle - uprightAngle};
+  const RobotState state = arming.update(inputs, dt, kArmingConfig);
+  if (state != previous) onStateChanged(state);
+
+  if (motorTest.running()) {
+    float left = 0.0f, right = 0.0f;
+    if (motorTest.step(dt, MOTOR_TEST_COMMAND, left, right)) {
+      motorsDrive(left, right, 1.0f);
+    } else {
+      motorsStop();
+      Serial.println("-> Motor test done. Each wheel should have rolled the robot FORWARD.");
+    }
     return;
   }
 
-  pitchRate = rawRate - gyroBias;
-  currentAngle = tiltFilter.update(pitchFromAccel(sample.ax, sample.ay, sample.az), pitchRate,
-                                   dt, IMU_FILTER_TIME_CONSTANT_S);
-  updateDriveRamps(dt);
-  targetAngle = settings.baseAngle + moveTilt;
-
-  // Safety cutoff: tipped over too far to recover (picked up or already
-  // fallen) or the battery is empty: stop instead of fighting the ground.
-  if (fabsf(currentAngle - targetAngle) > FALL_ANGLE_DEG || batteryLow()) {
+  if (state != RobotState::Balancing) {
     motorsStop();
-    resetBalance();
     return;
   }
 
   // Positive error = leaning forward past the target, and a positive output
   // drives forward: the wheels roll under the falling body.
-  error = currentAngle - targetAngle;
-  integral = clampf(integral + error * dt, -60.0f, 60.0f);  // anti-windup clamp
-  const float derivative = (error - prevError) / dt;
-  prevError = error;
-  pidOutput = settings.kp * error + settings.ki * integral + settings.kd * derivative;
+  const PidGains gains = {settings.kp, settings.ki, settings.kd};
+  pidOutput = pid.update(currentAngle - targetAngle, pitchRate, dt, gains, PID_INTEGRAL_LIMIT,
+                         kMaxCommand);
   motorsDrive(pidOutput - turnBias, pidOutput + turnBias, batteryCompensation());
-
-  outputAvg = outputAvg * 0.999f + pidOutput * 0.001f;
-  if (settings.autoTrim) {
-    settings.baseAngle += outputAvg * trimRate;
-  }
+  autoTrim.update(pidOutput, dt, settings.autoTrim && btCommand == 'L', AUTOTRIM_RATE,
+                  AUTOTRIM_AVERAGE_S, AUTOTRIM_LIMIT_DEG);
 }
 
-void resetBalance() {
-  integral = 0.0f;
-  prevError = 0.0f;
+void onStateChanged(RobotState state) {
+  pid.reset();  // every (re)start of balancing begins from a clean controller
   pidOutput = 0.0f;
+  Serial.printf("-> State: %s\n", stateName(state));
+  if (state == RobotState::Waiting) {
+    Serial.println("   Hold the robot upright: the motors start after half a second.");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -242,8 +256,8 @@ void logStatus() {
   static uint32_t lastLogMs = 0;
   if (millis() - lastLogMs < 100) return;
   lastLogMs = millis();
-  Serial.printf("Angle: %.2f | Target: %.2f | OutAvg: %.2f | Kp: %.2f | Ki: %.2f | Kd: %.2f | PID: %.2f\n",
-                currentAngle, targetAngle, outputAvg, settings.kp, settings.ki, settings.kd, pidOutput);
+  Serial.printf("%s | Angle: %.2f | Target: %.2f | Trim: %.2f | PID: %.2f\n", stateName(arming.state),
+                currentAngle, targetAngle, autoTrim.offset, pidOutput);
 }
 
 // ---------------------------------------------------------------------------
@@ -262,19 +276,63 @@ void handleCommandLine(const char* line) {
     case ParseStatus::Ok: break;
   }
 
-  if (strcmp(cmd.name, "calib") == 0) {
-    startGyroCalibration();
-    return;
-  }
+  if (handleActionCommand(cmd.name)) return;
 
+  // "save" keeps the learned auto-trim correction as part of baseAngle.
+  if (strcmp(cmd.name, "save") == 0) {
+    settings.baseAngle = clampf(settings.baseAngle + autoTrim.offset, -45.0f, 45.0f);
+    autoTrim.reset();
+  }
   const float oldKi = settings.ki;
+  const float oldBase = settings.baseAngle;
   const bool oldAutoTrim = settings.autoTrim;
   if (!handleSettingsCommand(cmd, settings, Serial)) {
     Serial.printf("! Unknown command '%s'. Type 'help'.\n", cmd.name);
     return;
   }
-  if (settings.ki != oldKi) integral = 0.0f;  // a big Ki change must not cause a kick
-  if (settings.autoTrim != oldAutoTrim) outputAvg = 0.0f;
+  if (settings.ki != oldKi) pid.reset();  // a big Ki change must not cause a kick
+  if (settings.baseAngle != oldBase || settings.autoTrim != oldAutoTrim) autoTrim.reset();
+}
+
+// Commands that act on the robot rather than change a setting.
+bool handleActionCommand(const char* name) {
+  const bool balancing = arming.state == RobotState::Balancing;
+  if (strcmp(name, "stop") == 0) {
+    requestStop(true);
+  } else if (strcmp(name, "go") == 0) {
+    requestStop(false);
+  } else if (strcmp(name, "calib") == 0) {
+    if (balancing) {
+      Serial.println("! Stop the robot first ('stop'), then 'calib'.");
+    } else {
+      startGyroCalibration();
+    }
+  } else if (strcmp(name, "zero") == 0) {
+    if (balancing) {
+      Serial.println("! Stop the robot first ('stop'), hold it at its balance point, then 'zero'.");
+    } else {
+      settings.baseAngle = clampf(currentAngle, -45.0f, 45.0f);
+      autoTrim.reset();
+      Serial.printf("-> base = %.2f (current angle). Type 'save' to keep it.\n", settings.baseAngle);
+    }
+  } else if (strcmp(name, "motortest") == 0) {
+    if (balancing) {
+      Serial.println("! Stop the robot first ('stop') and hold it with the wheels in the air.");
+    } else {
+      Serial.println("-> Motor test: left wheel, pause, right wheel.");
+      motorTest.start();
+    }
+  } else {
+    return false;
+  }
+  return true;
+}
+
+void requestStop(bool stop) {
+  if (stop == stopRequested) return;
+  stopRequested = stop;
+  Serial.println(stop ? "-> Emergency stop: motors off. 'go' (or G on the phone) to continue."
+                      : "-> Go: hold the robot upright to start balancing.");
 }
 
 void readSerialCommands() {
@@ -298,6 +356,10 @@ void readBluetoothCommands() {
     if (c == 'W' || c == 'S' || c == 'A' || c == 'D' || c == 'L') {
       btCommand = c;
       lastBtCommandMs = millis();
+    } else if (c == 'X') {
+      requestStop(true);
+    } else if (c == 'G') {
+      requestStop(false);
     }
   }
   if (millis() - lastBtCommandMs > settings.remoteTimeoutMs) {
